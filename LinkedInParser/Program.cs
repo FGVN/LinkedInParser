@@ -6,18 +6,26 @@ class Program
     static async Task Main(string[] args)
     {
         string cookieFilePath = "auth_cookies.json";
+        string proxyServer = null;
+
+        // Check if proxy server is provided as command-line argument
+        if (args.Length > 0)
+        {
+            Console.WriteLine("Proxy is used");
+            proxyServer = args[0];
+        }
 
         // Authenticate user and save cookies if necessary
-        await AuthenticateAndSaveCookiesIfNeeded(cookieFilePath);
+        await AuthenticateAndSaveCookiesIfNeeded(cookieFilePath, proxyServer);
 
         // Use saved cookies to navigate to LinkedIn feed page
-        await NavigateToLinkedInFeed(cookieFilePath);
+        await NavigateToLinkedInFeed(cookieFilePath, proxyServer);
 
         Console.WriteLine("Press any key to exit...");
         Console.ReadKey();
     }
 
-    static async Task AuthenticateAndSaveCookiesIfNeeded(string cookieFilePath)
+    static async Task AuthenticateAndSaveCookiesIfNeeded(string cookieFilePath, string proxyServer = null)
     {
         if (!File.Exists(cookieFilePath))
         {
@@ -25,21 +33,44 @@ class Program
 
             var browserOptions = new BrowserTypeLaunchOptions
             {
-                Headless = false
+                Headless = false,
+                Timeout = 60000,
             };
 
-            var browser = await Playwright.CreateAsync().ContinueWith(t => t.Result.Chromium.LaunchAsync(browserOptions)).Unwrap();
-            var authContext = await browser.NewContextAsync();
-            var authenticationPage = await authContext.NewPageAsync();
-
-            await authenticationPage.GotoAsync("https://www.linkedin.com");
-            await authenticationPage.WaitForLoadStateAsync();
-
-            var loginButton = await authenticationPage.QuerySelectorAsync("a.nav__button-secondary");
-            if (loginButton != null)
+            if (proxyServer != null)
             {
-                Console.WriteLine("Please log in to LinkedIn. Press any key to continue after logging in...");
-                Console.ReadKey();
+                browserOptions.Proxy = new Proxy
+                {
+                    Server = proxyServer,
+                };
+            }
+
+            var browser = await Playwright.CreateAsync().ContinueWith(t => t.Result.Chromium.LaunchAsync(browserOptions)).Unwrap();
+
+            var contextOptions = new BrowserNewContextOptions
+            {
+                IgnoreHTTPSErrors = true,
+            };
+
+            var authContext = await browser.NewContextAsync(contextOptions);
+            var authenticationPage = await authContext.NewPageAsync();
+            try
+            {
+                await authenticationPage.GotoAsync("https://www.linkedin.com", new PageGotoOptions { Timeout = 60000 });
+            }
+            catch (Exception ex) 
+            {
+                Console.WriteLine(ex.Message);
+                return;
+            }
+            await authenticationPage.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 60000 });
+
+            // Check if the user is already logged in by looking for elements specific to the page after successful login
+            var profilePictureElement = await authenticationPage.QuerySelectorAsync("img.feed-identity-module__member-photo");
+            if (profilePictureElement == null)
+            {
+                // User is not logged in, perform automatic login
+                await AutomaticLogin(authenticationPage);
             }
 
             var authCookies = await authContext.CookiesAsync();
@@ -49,11 +80,51 @@ class Program
         }
     }
 
-    static async Task NavigateToLinkedInFeed(string cookieFilePath)
+    static async Task AutomaticLogin(IPage authenticationPage)
+    {
+        Console.WriteLine("Automatic login...");
+
+        // Create a task completion source to signal when navigation occurs
+        var navigationTaskCompletionSource = new TaskCompletionSource<bool>();
+
+        authenticationPage.FrameNavigated += (sender, args) =>
+        {
+            if (args.Url.StartsWith("https://www.linkedin.com/feed/"))
+            {
+                Console.WriteLine("Logged in successfully.");
+                navigationTaskCompletionSource.TrySetResult(true);
+            }
+        };
+
+        await navigationTaskCompletionSource.Task;
+    }
+
+
+    static async Task NavigateToLinkedInFeed(string cookieFilePath, string proxyServer = null)
     {
         using var playwright = await Playwright.CreateAsync();
-        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = true });
-        var context = await browser.NewContextAsync();
+        var browserOptions = new BrowserTypeLaunchOptions 
+        { 
+            Headless = true,
+            Timeout = 60000,
+        };
+
+        if (proxyServer != null)
+        {
+            browserOptions.Proxy = new Proxy
+            {
+                Server = proxyServer,
+            };
+        }
+
+        var browser = await playwright.Chromium.LaunchAsync(browserOptions);
+
+        var contextOptions = new BrowserNewContextOptions
+        {
+            IgnoreHTTPSErrors = true,
+        };
+
+        var context = await browser.NewContextAsync(contextOptions);
         var page = await context.NewPageAsync();
 
         var cookiesJson = File.ReadAllText(cookieFilePath);
@@ -64,7 +135,7 @@ class Program
             await context.AddCookiesAsync(new[] { cookie });
         }
 
-        await page.GotoAsync("https://www.linkedin.com/feed/");
+        await page.GotoAsync("https://www.linkedin.com/feed/", new PageGotoOptions { Timeout = 60000 });
         await page.WaitForLoadStateAsync();
 
         var profilePictureElement = await page.QuerySelectorAsync("img.feed-identity-module__member-photo");
@@ -89,3 +160,4 @@ class Program
         await browser.CloseAsync();
     }
 }
+
